@@ -16,6 +16,13 @@ from .graph_generation import (
     random_chain_field,
 )
 from .exact_coloring import greedy_dsat_coloring, chromatic_number_exact
+from .critical_subgraph import find_vertex_critical_4chromatic_subgraph
+from .abstract_embed.abstract_graph import (
+    AbstractGraph,
+    random_erdos_renyi_graph,
+    compute_chromatic_number,
+)
+from .abstract_embed.embedder import embed_abstract_graph, realized_geometric_graph
 
 
 ROOT = Path(__file__).resolve().parent
@@ -69,8 +76,9 @@ def main():
 
     # strategy = 1 使用“菱形 + 正三角形 + 单位圆”结构化撒点；
     # strategy = 2 使用“高斯混合随机撒点”策略；
-    # strategy = 3 使用“单位长度链 + 额外约束”策略。
-    strategy = 1
+    # strategy = 3 使用“单位长度链 + 额外约束”策略；
+    # strategy = 4 使用“抽象图 -> 平面嵌入”策略。
+    strategy = 4
 
     n_trials = 100            # 每种撒点策略下的重复次数
 
@@ -89,6 +97,14 @@ def main():
     min_chain_len = 3        # 链最短长度
     max_chain_len = 9       # 链最长长度
     min_extra_pairs = 3      # 每条链要求的“额外约束”对数（非相邻点距离≈1）
+
+    # 抽象图嵌入相关参数（strategy == 4 时使用）
+    abs_n_vertices = 10
+    abs_p_edge = 0.5
+    abs_target_chi = 4
+    abs_n_restarts = 8
+    abs_n_steps = 2500
+    abs_step_size = 0.005
 
     rng = np.random.default_rng(0)
 
@@ -131,7 +147,7 @@ def main():
                 sigma=sigma,
                 seed=base_seed,
             )
-        else:
+        elif strategy == 3:
             # 方法三：由单位长度链 + 额外约束构成的 motif 随机场
             graph = random_chain_field(
                 n_chains=n_chains,
@@ -142,6 +158,44 @@ def main():
                 max_chain_len=max_chain_len,
                 min_extra_pairs=min_extra_pairs,
             )
+        else:
+            # 方法四：先在抽象层面随机生成图并算色数，再嵌入到平面
+            # 这里只考虑 chi >= abs_target_chi 的抽象候选
+            abs_graph: AbstractGraph | None = None
+            for _ in range(20):  # 每个 trial 最多尝试 20 次抽象图
+                g_abs = random_erdos_renyi_graph(
+                    n=abs_n_vertices,
+                    p_edge=abs_p_edge,
+                    seed=int(rng.integers(1_000_000_000)),
+                )
+                chi_abs = compute_chromatic_number(g_abs)
+                if chi_abs >= abs_target_chi:
+                    abs_graph = g_abs
+                    print(
+                        f"  abstract graph: n={g_abs.n}, |E|={len(g_abs.edges)}, chi={chi_abs}",
+                    )
+                    break
+
+            if abs_graph is None:
+                # 本次 trial 没找到足够高色数的抽象图，跳过
+                print("  skip trial: no abstract graph with chi >= target found")
+                continue
+
+            emb = embed_abstract_graph(
+                abs_graph,
+                epsilon=epsilon,
+                side=side,
+                n_restarts=abs_n_restarts,
+                n_steps=abs_n_steps,
+                step_size=abs_step_size,
+                # 非边损失在 embedder 中已被忽略，这里参数仅占位
+                nonedge_margin=0.0,
+                nonedge_weight=0.0,
+                seed=int(rng.integers(1_000_000_000)),
+            )
+
+            pts, edges = realized_geometric_graph(emb, epsilon=epsilon)
+            graph = GeometricGraph(points=pts, edges=edges)
 
         # 合并数值上重复的点，去掉重复边
         graph = merge_duplicate_points(graph)
@@ -174,6 +228,8 @@ def main():
     best_graph = None
     best_exact_k = -1
     best_colors = None
+    # 记录所有需要做精确染色的候选，用于后续统一做“删点简化”比较
+    evaluated_candidates: list[tuple[GeometricGraph, int, list[int]]] = []
 
     if approx4_candidates:
         total = len(approx4_candidates)
@@ -191,6 +247,7 @@ def main():
                 best_exact_k = exact_k
                 best_graph = g
                 best_colors = colors
+            evaluated_candidates.append((g, exact_k, colors))
     else:
         # 若没有 approx_k=4 的图，则退化为：只评估 top_k 个候选
         top_k = min(3, len(candidates_sorted))
@@ -210,6 +267,7 @@ def main():
                 best_exact_k = exact_k
                 best_graph = g
                 best_colors = colors
+            evaluated_candidates.append((g, exact_k, colors))
 
     assert best_graph is not None and best_colors is not None
 
@@ -225,9 +283,10 @@ def main():
         f"approx_k={approx_k}, exact_k={exact_k}",
     )
 
-    # ========== 保存带有精确染色的图片 ==========
-    out_dir = ROOT / "outputs"
-    out_dir.mkdir(exist_ok=True)
+    # ========== 保存带有精确染色的图片（按 strategy 分子目录） ==========
+    out_dir = ROOT / "outputs" / str(strategy)
+    # 确保 outputs 以及对应 strategy 子目录都自动创建
+    out_dir.mkdir(parents=True, exist_ok=True)
     save_path = out_dir / "parallelogram_unitcircle_colored.png"
 
     title = (
@@ -239,6 +298,64 @@ def main():
     plot_colored_graph(graph, exact_colors, title=title, save_path=str(save_path))
 
     print("Done. Colored graph saved.")
+
+    # ========== 对所有做过精确染色的候选统一做删点简化，
+    # 逐个打印简化结果，并在色数最高的一批中
+    # 选出“顶点数最少”的临界子图单独输出一张图 ==========
+    if evaluated_candidates:
+        max_exact_k_overall = max(ex_k for _, ex_k, _ in evaluated_candidates)
+
+        print("\nSimplifying all evaluated candidates to vertex-critical subgraphs...")
+
+        best_crit_graph: GeometricGraph | None = None
+        best_crit_colors: list[int] | None = None
+        best_crit_exact_k = max_exact_k_overall
+        best_crit_n: int | None = None
+        best_crit_orig_n: int | None = None
+
+        for g, ex_k, _ in evaluated_candidates:
+            print(
+                f"  simplifying candidate: n={g.n}, |E|={len(g.edges)}, exact_k={ex_k}",
+            )
+            crit_graph = find_vertex_critical_4chromatic_subgraph(g)
+            chi_crit, crit_colors = chromatic_number_exact(
+                crit_graph.n,
+                crit_graph.edges,
+            )
+            print(
+                "    -> critical: "
+                f"n={crit_graph.n}, |E|={len(crit_graph.edges)}, exact_k={chi_crit}",
+            )
+
+            # 仅在“色数最高的一批”中，用“顶点数最少”选出一个代表图像
+            if chi_crit == max_exact_k_overall:
+                if best_crit_graph is None or crit_graph.n < (best_crit_n or 10**9):
+                    best_crit_graph = crit_graph
+                    best_crit_colors = crit_colors
+                    best_crit_n = crit_graph.n
+                    best_crit_orig_n = g.n
+
+        if best_crit_graph is not None and best_crit_colors is not None:
+            print(
+                "\nBest critical subgraph among evaluated candidates:",
+                f"orig_n={best_crit_orig_n}, critical_n={best_crit_n}, "
+                f"exact_k={best_crit_exact_k}",
+            )
+
+            crit_save_path = out_dir / "parallelogram_unitcircle_critical.png"
+            crit_title = (
+                f"critical: n={best_crit_graph.n}, |E|={len(best_crit_graph.edges)}, "
+                f"exact_k={best_crit_exact_k}, eps_band={epsilon}"
+            )
+            plot_colored_graph(
+                best_crit_graph,
+                best_crit_colors,
+                title=crit_title,
+                save_path=str(crit_save_path),
+            )
+            print("Critical subgraph figure saved.")
+        else:
+            print("\nNo critical subgraph extracted from evaluated candidates.")
 
 
 if __name__ == "__main__":

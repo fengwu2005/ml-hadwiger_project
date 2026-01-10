@@ -3,8 +3,8 @@
 本项目围绕“在平面上随机或优化构造单位距离图，并研究其色数”展开，
 大致包含三条实验线：
 
-1. **随机几何图 + 精确染色**：在平面上撒结构化点（菱形 / 正三角形 / 单位圆），按距离≈1 连边，
-   用 DSATUR 风格回溯算法计算精确色数，并画出带颜色的几何图（入口：`main.py`）。
+1. **随机几何图 + 精确染色**：在平面上撒结构化点（菱形 / 正三角形 / 单位圆 / 高斯场 / 链式 motif），按距离≈1 连边，
+   用 DSATUR 风格回溯算法计算精确色数，并画出带颜色的几何图（入口：`main.py`，`strategy`=1/2/3/4）。
 2. **soft coloring + ML 打分**：把 k-染色 Relax 成可导的概率分布，用 PyTorch 训练“软染色”模型，
    通过 3 色 / 4 色损失差值来度量图的“3 色困难度”，用于筛选更值得精确搜索的图（核心：`soft_coloring.py`, `ml_search.py`）。
 3. **抽象图嵌入到几何图**：先在抽象层面随机生成图并算精确色数，再用优化算法把其嵌入到平面，
@@ -44,29 +44,48 @@ python -m hadwiger_project.main
 主流程（`main()`）：
 
 1. 设定全局参数：
-   - `epsilon`：单位距离带宽，边在 `[1-eps, 1+eps]` 内连边；
-   - `side`：工作区域 `[0, side]^2`；
-   - `strategy`：几何图构造策略（1：菱形+三角形+单位圆；2：高斯场；3：链式 motif）；
+    - `epsilon`：单位距离带宽，边在 `[1-eps, 1+eps]` 内连边；
+    - `side`：工作区域 `[0, side]^2`；
+    - `strategy`：几何图构造策略
+       - 1：菱形 + 正三角形 + 单位圆；
+       - 2：高斯混合随机场；
+       - 3：单位长度链 + 额外约束；
+       - 4：抽象图 → 平面嵌入得到的单位距离图；
    - `n_trials`：独立采样次数。
 2. 对每个 trial：
-   - 根据 `strategy` 调用 `graph_generation.py` 中的构造函数生成几何图：
-     - `random_parallelogram_field()`：撒入若干由两个公边正三角形组成的 **菱形 motif**；
-     - `add_random_triangles()`：在基础图上额外撒入正三角形 motif；
-     - `grow_on_unit_circles()`：在已有点的单位圆上继续撒点；
-     - 或使用 `random_gaussian_field()`、`random_chain_field()` 生成其它风格几何图；
+    - 根据 `strategy` 生成几何图：
+       - 1：`random_parallelogram_field()` + `add_random_triangles()` + `grow_on_unit_circles()`；
+       - 2：`random_gaussian_field()`；
+       - 3：`random_chain_field()`；
+       - 4：先在 `abstract_embed/abstract_graph.py` 中用 Erdos–Renyi 生成抽象图、算精确色数，
+          只保留色数至少为给定阈值的抽象候选，再通过 `abstract_embed/embedder.py` 中的
+          `embed_abstract_graph()` 把其嵌入到 `[0, side]^2`，最后用 `realized_geometric_graph()`
+          得到单位距离几何图。
    - `merge_duplicate_points()` 合并数值上重复的点并去重边；
    - 使用 `greedy_dsat_coloring()` 得到近似色数 `approx_k` 作为快速打分。
 3. 在所有试验中，挑出最有希望需要更多颜色的若干 candidate，对它们调用
    `chromatic_number_exact()` 做 **精确 DSATUR 回溯染色**，得到真正的最小色数 `exact_k`。
-4. 对最佳候选图调用 `plot_colored_graph()` 画图并保存到：
+4. 对最佳候选图调用 `plot_colored_graph()` 画图并保存到（按 strategy 分目录）：
 
-   - `hadwiger_project/outputs/parallelogram_unitcircle_colored.png`
+   - `hadwiger_project/outputs/<strategy>/parallelogram_unitcircle_colored.png`
 
 图像说明：
 
 - 顶点：使用 `tab10` 调色板按颜色编号着色；
 - 边：用较细的黑色线条展示单位距离约束下的连接关系；
 - 标题中包含：`n`、`|E|`、`approx_k`、`exact_k`、`eps_band` 等信息。
+
+此外，对所有需要做精确染色的候选图，主程序会：
+
+1. 先比较它们的精确色数 `exact_k`，找到其中色数最高的一批（通常是 4-色的候选）；
+2. 对这批候选逐一调用 `find_vertex_critical_4chromatic_subgraph` 做“贪心删点简化”，
+   在**保持各自色数不变**的前提下尽量删点；
+3. 在这些简化后的图中，选出**顶点数最少**的那个作为“最简高色数候选”，并额外输出：
+
+- `hadwiger_project/outputs/<strategy>/parallelogram_unitcircle_critical.png`
+
+这张图对应的几何图满足：χ(G)=k（与其原候选完全相同的色数），
+且删去其中任何一个顶点后得到的诱导子图色数都会下降，因而是一个顶点临界的 k-色图。
 
 ---
 
@@ -107,12 +126,15 @@ python -m hadwiger_project.main
 
 ---
 
-## 3. 抽象图 → 几何 realization（`abstract_embed/`）
+## 3. 抽象图 → 几何 realization（`abstract_embed/` & `strategy = 4`）
 
 文件夹：`abstract_embed/`
 
 - `abstract_graph.py`：定义抽象无向图 `AbstractGraph` 以及 `random_erdos_renyi_graph`、`compute_chromatic_number` 等；
-- `embedder.py`：实现从抽象图到平面点集的嵌入优化（使边长≈1、非边远离 1）；
+- `embedder.py`：实现从抽象图到平面点集的嵌入优化（使边长≈1），
+   目前只对原图中的边施加“落在 [1-eps, 1+eps] 带宽内”的约束，
+   不再显式惩罚非边距离是否接近 1，从而允许几何 realization 中出现额外边，
+   只要求“原抽象图的边都是单位距离边”的包含关系；
 - `main.py`：入口脚本 `run_experiment()`，整体流程：
   1. 抽象层面：
      - 多次采样 Erdos–Renyi 抽象图（`n_vertices`, `p_edge`, `n_graph_samples`）；
@@ -139,7 +161,36 @@ python -m hadwiger_project.abstract_embed.main
 
 ---
 
-## 4. 代码结构一览
+## 4. 从 4-色图提取最小 4-色子图（`critical_subgraph.py`）
+
+很多时候你会先通过随机 / 嵌入得到一张色数为 4 的较大几何图，
+然后希望“抽干”它，得到一个在**删去任何一个顶点后都变成至多 3-色**的 4-色临界子图。
+
+文件：`critical_subgraph.py`
+
+- `_induced_subgraph(graph, keep_vertices)`：对 `GeometricGraph` 取诱导子图并重新编号；
+- `find_vertex_critical_4chromatic_subgraph(graph, max_states=None)`：
+   - 先用 `chromatic_number_exact` 验证输入图确实是 4-色；
+   - 然后贪心尝试删点：每次尝试删去一个顶点，若删后图的色数仍为 4，就接受这次删除；
+   - 直到再也不能删点而保持 4-色为止；
+   - 返回的子图满足：色数为 4，且对任意顶点 v，删去 v 的诱导子图至多 3-色（顶点临界 4-色图）。
+
+简单用法示例（伪代码）：
+
+```python
+from hadwiger_project.critical_subgraph import find_vertex_critical_4chromatic_subgraph
+
+# 假设 g 是你已经构造好、且经 exact_coloring 验证 chi(g)=4 的 GeometricGraph
+g_crit = find_vertex_critical_4chromatic_subgraph(g)
+print("original n=", g.n, "critical n=", g_crit.n)
+```
+
+> 注意：这个过程会多次调用 `chromatic_number_exact`，在点很多时可能较慢，
+> 建议先在规模不太大的候选图上使用，或通过 `max_states` 对回溯做轻微截断。
+
+---
+
+## 5. 代码结构一览
 
 - `main.py`：随机几何图 + 精确染色 + 可视化主入口；
 - `graph_generation.py`：各种几何随机图构造函数与 `GeometricGraph` 数据结构；
@@ -147,12 +198,13 @@ python -m hadwiger_project.abstract_embed.main
 - `exact_coloring.py`：贪心 DSAT + DSATUR 回溯，给出近似色数与精确色数；
 - `soft_coloring.py`：可导的 soft k-染色模型及训练函数；
 - `ml_search.py`：基于 soft coloring 的图“难度打分”工具；
+- `critical_subgraph.py`：从 4-色几何图中提取顶点最小的 4-色临界子图；
 - `abstract_embed/`：从抽象图（networkx 风格）到具体几何单位距离图的嵌入与实验脚本；
 - `outputs/`, `abstract_embed/outputs/`：运行脚本后生成的带颜色图像输出目录。
 
 ---
 
-## 5. 报告 / 项目说明撰写提示（可选）
+## 6. 报告 / 项目说明撰写提示（可选）
 
 若这是课程或项目作业的一部分，可以围绕以下问题展开：
 

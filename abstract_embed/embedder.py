@@ -14,7 +14,7 @@ class EmbeddingResult:
     points: np.ndarray  # (n, 2)
     loss: float
     n_edge_violations: int
-    n_nonedge_violations: int
+    n_nonedge_violations: int  # 现在 loss 中不再惩罚非边，这里仅保留计数接口（始终为 0）。
 
 
 def _loss_and_grad(
@@ -24,7 +24,7 @@ def _loss_and_grad(
     nonedge_margin: float,
     nonedge_weight: float,
 ) -> Tuple[float, np.ndarray, int, int]:
-    """对给定坐标计算损失和梯度（更直观的带状约束形式）。
+    """对给定坐标计算损失和梯度（只约束“边”的单位距离带）。
 
     记 d_ij = ||x_i - x_j||。
 
@@ -34,12 +34,10 @@ def _loss_and_grad(
         否则按 (|d_ij - 1| - epsilon)^2 罚，这只惩罚“超出带宽的部分”。
 
     - 对于非边 (i, j)：
-        希望远离 1，一般 nonedge_margin > epsilon。
-        若 |d_ij - 1| >= nonedge_margin，则不惩罚；
-        否则按 (nonedge_margin - |d_ij - 1|)^2 罚，
-        表示“离开危险带 [1 - nonedge_margin, 1 + nonedge_margin] 不够远”。
+        不再显式惩罚；允许在几何 realization 中出现额外边，
+        只要原图中的所有边都被包含在单位距离边集合里即可。
 
-    总损失 = 平均边损失 + nonedge_weight * 平均非边损失。
+    总损失 = 平均边损失。返回的 n_nonedge_violations 恒为 0。
     """
 
     n = graph.n
@@ -54,65 +52,43 @@ def _loss_and_grad(
 
     grad = np.zeros_like(pts)
     edge_loss = 0.0
-    nonedge_loss = 0.0
     n_edge_pairs = 0
-    n_nonedge_pairs = 0
-
     n_edge_viol = 0
-    n_nonedge_viol = 0
 
+    # 这里只遍历边对；非边完全忽略
     for i in range(n):
         for j in range(i + 1, n):
+            if not is_edge[i, j]:
+                continue
+
             diff = pts[i] - pts[j]
             d = float(np.linalg.norm(diff) + 1e-9)
 
-            if is_edge[i, j]:
-                # 边：只惩罚“跑出 [1-eps, 1+eps] 的那一截”
-                delta = abs(d - 1.0)
-                if delta > epsilon:
-                    over = delta - epsilon
-                    l = over * over
-                    edge_loss += l
-                    n_edge_pairs += 1
-                    n_edge_viol += 1
+            # 边：只惩罚“跑出 [1-eps, 1+eps] 的那一截”
+            delta = abs(d - 1.0)
+            if delta > epsilon:
+                over = delta - epsilon
+                l = over * over
+                edge_loss += l
+                n_edge_pairs += 1
+                n_edge_viol += 1
 
-                    # dL / dd = 2 * over * sign(d - 1)
-                    sign = 1.0 if (d - 1.0) > 0.0 else -1.0
-                    dL_dd = 2.0 * over * sign
-                    coeff = dL_dd / d
-                    g = coeff * diff
-                    grad[i] += g
-                    grad[j] -= g
-                else:
-                    # 在允许带宽里，不计入损失，但计数一次 pair 方便平均
-                    n_edge_pairs += 1
+                # dL / dd = 2 * over * sign(d - 1)
+                sign = 1.0 if (d - 1.0) > 0.0 else -1.0
+                dL_dd = 2.0 * over * sign
+                coeff = dL_dd / d
+                g = coeff * diff
+                grad[i] += g
+                grad[j] -= g
             else:
-                # 非边：只惩罚“进入 [1-nonedge_margin, 1+nonedge_margin] 危险带”的情况
-                delta = abs(d - 1.0)
-                if delta < nonedge_margin:
-                    gap = nonedge_margin - delta
-                    l = gap * gap
-                    nonedge_loss += l
-                    n_nonedge_pairs += 1
-                    n_nonedge_viol += 1
-
-                    # dL / dd = -2 * gap * sign(d - 1)
-                    sign = 1.0 if (d - 1.0) > 0.0 else -1.0
-                    dL_dd = -2.0 * gap * sign
-                    coeff = dL_dd / d
-                    g = coeff * diff
-                    grad[i] += g
-                    grad[j] -= g
-                else:
-                    # 足够远，不计入损失但计数一次 pair 方便平均
-                    n_nonedge_pairs += 1
+                # 在允许带宽里，不计入损失，但计数一次 pair 方便平均
+                n_edge_pairs += 1
 
     if n_edge_pairs > 0:
         edge_loss /= n_edge_pairs
-    if n_nonedge_pairs > 0:
-        nonedge_loss /= n_nonedge_pairs
 
-    total_loss = edge_loss + nonedge_weight * nonedge_loss
+    total_loss = edge_loss
+    n_nonedge_viol = 0
     return total_loss, grad, n_edge_viol, n_nonedge_viol
 
 
